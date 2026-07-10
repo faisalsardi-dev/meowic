@@ -1,0 +1,5 @@
+# runtime databases (session auth material + synced messages)
+/store/data/
+
+# built binary
+/meowic
