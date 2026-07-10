@@ -20,7 +20,7 @@ Run from the repo root (data is stored in `./store/data/`):
 ./meowic doctor
 ```
 
-With no session, a QR code is printed to the terminal. Scan it on your phone: **WhatsApp → Settings → Linked devices → Link a device**. The session is saved to `store/data/session.db`; message history syncs into `store/data/messages.db` while connected.
+With no session, you are prompted for the account's phone number (international format, digits only) and an 8-character linking code is printed to the terminal. Enter it on your phone: **WhatsApp → Settings → Linked devices → Link a device → Link with phone number instead**. The session is saved to `store/data/session.db`; message history syncs into `store/data/messages.db` while connected.
 
 ## Usage
 

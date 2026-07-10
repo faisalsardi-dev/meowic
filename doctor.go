@@ -22,7 +22,7 @@ func HealthReport(m *Meow) (any, error) {
 	}
 
 	r := &report{}
-	// On a first run this triggers QR pairing (rendered to stderr).
+	// On a first run this triggers linking-code pairing (prompt on stderr).
 	if err := m.Connect(); err != nil {
 		r.ConnectError = err.Error()
 	}

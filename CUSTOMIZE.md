@@ -100,7 +100,7 @@ CALLS
 
 ---
 MINIMAL SUBSET LIKELY NEEDED FOR A TYPICAL CLI:
-  Connect() / GetQRChannel()    -> auth
+  Connect() / PairPhone()       -> auth
   AddEventHandler()             -> receive messages
   SendMessage()                 -> send text
   Download() / DownloadToFile() -> media in (quarantine folder)
@@ -156,9 +156,10 @@ but with specific, non-negotiable exceptions.
 > — the CLI should never be able to unlink itself. `Disconnect()` exists
 > only as internal plumbing inside `meow.go` (called on process shutdown
 > signals like Ctrl+C), never as something an LLM can invoke on demand.
-> `PairPhone()` is an alternate first-time pairing method (phone number
-> instead of QR) — redundant given QR pairing already works, so it was
-> left out rather than maintaining two pairing paths. If a future variant
+> `PairPhone()` is the first-time pairing method (a linking code typed
+> into the phone, chosen over QR scanning) — it is internal plumbing in
+> `meow.go`'s pairing flow, never a CLI command, so there is still only
+> one pairing path and nothing extra exposed. If a future variant
 > needs any of these exposed, treat it the same as any other Layer 1
 > decision: a deliberate, individually-considered choice, not a default.
 

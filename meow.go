@@ -6,21 +6,15 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
-	"net/http"
 	"os"
-	"os/exec"
-	"runtime"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
@@ -69,8 +63,8 @@ func (m *Meow) HasSession() bool { return m.cli.Store.ID != nil }
 func (m *Meow) IsConnected() bool { return m.cli.IsConnected() }
 func (m *Meow) IsLoggedIn() bool  { return m.cli.IsLoggedIn() }
 
-// Connect establishes the connection, running first-time QR pairing
-// automatically when no session exists yet.
+// Connect establishes the connection, running first-time linking-code
+// pairing automatically when no session exists yet.
 func (m *Meow) Connect() error {
 	if m.cli.IsConnected() && m.cli.IsLoggedIn() {
 		return nil
@@ -87,157 +81,53 @@ func (m *Meow) Connect() error {
 	return nil
 }
 
-// pairAndConnect runs the first-run QR flow: the QR code is served on a
-// loopback-only browser page (stdout stays JSON-only) and we block until
-// the phone scans it or the pairing window times out. If the local page
-// can't be started, it falls back to rendering on stderr as before.
+// pairAndConnect runs the first-run pairing flow: it asks for the
+// account's phone number on stdin (prompt on stderr — stdout stays
+// JSON-only), requests an 8-character linking code from WhatsApp, and
+// blocks until the code is entered on the phone or the window times out.
 func (m *Meow) pairAndConnect() error {
-	qrChan, err := m.cli.GetQRChannel(m.ctx)
-	if err != nil {
-		return err
-	}
 	if err := m.cli.Connect(); err != nil {
 		return err
 	}
-	web, webErr := startPairQRWeb()
-	if webErr != nil {
-		fmt.Fprintln(os.Stderr, "no session found — scan the QR code with WhatsApp (Settings > Linked devices > Link a device)")
-	} else {
-		defer web.close()
-		fmt.Fprintf(os.Stderr, "no session found — scan the QR code at %s with WhatsApp (Settings > Linked devices > Link a device)\n", web.url)
-		web.openBrowser()
+	fmt.Fprint(os.Stderr, "no session found — enter this account's phone number in international format (e.g. 15551234567): ")
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("reading phone number: %w", err)
 	}
-	for item := range qrChan {
-		switch item.Event {
-		case whatsmeow.QRChannelEventCode:
-			if webErr != nil {
-				qrterminal.GenerateHalfBlock(item.Code, qrterminal.L, os.Stderr)
-			} else {
-				web.setCode(item.Code)
-			}
-		case whatsmeow.QRChannelSuccess.Event:
-			if webErr == nil {
-				web.setState("paired")
-			}
+	phone := digitsOf(line)
+	if phone == "" {
+		return errors.New("no phone number entered")
+	}
+	code, err := m.cli.PairPhone(m.ctx, phone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+	if err != nil {
+		return fmt.Errorf("requesting linking code: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "on your phone: WhatsApp > Settings > Linked devices > Link a device > Link with phone number instead, then enter: %s\n", code)
+	deadline := time.Now().Add(3 * time.Minute)
+	for time.Now().Before(deadline) {
+		if m.cli.IsLoggedIn() {
 			m.afterFirstPair()
 			return nil
-		case whatsmeow.QRChannelTimeout.Event:
-			return errors.New("QR pairing timed out — run the command again to retry")
-		default:
-			if item.Error != nil {
-				return fmt.Errorf("pairing failed: %w", item.Error)
-			}
+		}
+		select {
+		case <-time.After(time.Second):
+		case <-m.ctx.Done():
+			return m.ctx.Err()
 		}
 	}
-	return errors.New("QR channel closed before pairing completed")
+	return errors.New("pairing timed out — run the command again to retry")
 }
 
-// pairQRWeb shows the pairing QR in a local browser tab: the same
-// half-block text qrterminal would print, in a <pre> so it stays
-// copyable. Bound to 127.0.0.1 on an OS-chosen free port — never
-// reachable from the network. WhatsApp rotates the code server-side,
-// so the page polls and repaints only when the code actually changes.
-type pairQRWeb struct {
-	mu    sync.Mutex
-	qr    string // half-block render of the current code
-	state string // "waiting" | "paired"
-	srv   *http.Server
-	url   string
-}
-
-func startPairQRWeb() (*pairQRWeb, error) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return nil, err
-	}
-	w := &pairQRWeb{state: "waiting", url: fmt.Sprintf("http://%s/", ln.Addr())}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(rw http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(rw, r)
-			return
+func digitsOf(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
 		}
-		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = rw.Write([]byte(pairQRPage))
-	})
-	mux.HandleFunc("/qr.json", func(rw http.ResponseWriter, _ *http.Request) {
-		w.mu.Lock()
-		payload := map[string]string{"state": w.state, "qr": w.qr}
-		w.mu.Unlock()
-		rw.Header().Set("Content-Type", "application/json")
-		rw.Header().Set("Cache-Control", "no-store")
-		_ = json.NewEncoder(rw).Encode(payload)
-	})
-	w.srv = &http.Server{Handler: mux}
-	go func() { _ = w.srv.Serve(ln) }()
-	return w, nil
-}
-
-func (w *pairQRWeb) close() { _ = w.srv.Close() }
-
-func (w *pairQRWeb) setCode(code string) {
-	var buf bytes.Buffer
-	qrterminal.GenerateHalfBlock(code, qrterminal.L, &buf)
-	w.mu.Lock()
-	w.qr = buf.String()
-	w.mu.Unlock()
-}
-
-func (w *pairQRWeb) setState(state string) {
-	w.mu.Lock()
-	w.state = state
-	w.mu.Unlock()
-}
-
-// openBrowser is best-effort: pairing works fine with the printed URL.
-func (w *pairQRWeb) openBrowser() {
-	switch runtime.GOOS {
-	case "darwin":
-		_ = exec.Command("open", w.url).Start()
-	case "linux":
-		_ = exec.Command("xdg-open", w.url).Start()
 	}
+	return b.String()
 }
 
-const pairQRPage = `<!doctype html>
-<meta charset="utf-8">
-<title>meowic — link WhatsApp</title>
-<style>
-  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
-         background:#111b21; color:#e9edef; font:16px/1.5 -apple-system, system-ui, sans-serif; }
-  main { text-align:center; padding:2rem; }
-  pre  { display:inline-block; font:14px/1 monospace; letter-spacing:0;
-         color:#fff; background:#000; padding:1.5em; }
-  #msg { margin-top:1rem; color:#8696a0; }
-  .ok  { color:#00a884; font-weight:600; }
-</style>
-<main>
-  <h1>Scan with WhatsApp</h1>
-  <pre id="qr">waiting for QR code…</pre>
-  <p id="msg">Settings &gt; Linked devices &gt; Link a device</p>
-</main>
-<script>
-  const qr = document.getElementById('qr'), msg = document.getElementById('msg');
-  const tick = async () => {
-    try {
-      const s = await (await fetch('/qr.json')).json();
-      if (s.state === 'paired') {
-        qr.remove();
-        msg.textContent = 'Paired successfully — you can close this tab.';
-        msg.className = 'ok';
-        clearInterval(timer);
-        return;
-      }
-      if (s.qr && s.qr !== qr.textContent) qr.textContent = s.qr;
-    } catch {
-      msg.textContent = 'meowic exited — run doctor again to pair.';
-      clearInterval(timer);
-    }
-  };
-  const timer = setInterval(tick, 2000);
-  tick();
-</script>
-`
 
 func (m *Meow) afterFirstPair() {
 	// session.db holds plaintext auth material — lock it down.
