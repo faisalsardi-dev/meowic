@@ -9,7 +9,7 @@ import (
 // ListNewsletterMessages fetches recent messages from a newsletter (channel).
 func ListNewsletterMessages(args []string, fetch func(jid string, count int) (any, error)) (any, error) {
 	if len(args) < 1 {
-		return nil, errors.New("usage: list-newsletter-messages <newsletter-jid> [count]")
+		return nil, errors.New("usage: list-newsletter-messages <newsletter-jid> [limit]")
 	}
 	if err := validateJID(args[0]); err != nil {
 		return nil, err
@@ -21,13 +21,17 @@ func ListNewsletterMessages(args []string, fetch func(jid string, count int) (an
 	return fetch(args[0], count)
 }
 
-// jidPattern is a SHAPE check, not a server whitelist: a numeric user part
-// (optionally "digits-digits" for legacy groups) followed by "@" and a
-// lowercase server. It accepts every WhatsApp address type — @s.whatsapp.net,
-// @g.us, @newsletter, @lid, and any server whatsmeow adds later — while still
-// rejecting garbage (###, abc@x) and bare numbers. Deciding WHICH valid JIDs
-// may be acted on is policy (logic/), never this generic format gate.
-var jidPattern = regexp.MustCompile(`^[0-9]+(-[0-9]+)?@[a-z.]+$`)
+// jidPattern accepts a JID iff the server is one of the 11 WhatsApp servers
+// whatsmeow knows (see types/jid.go constants; hardcoded here because actions/
+// stays free of whatsmeow imports) and the user part is at least one character
+// containing no whitespace and no extra "@". The user part is otherwise
+// unconstrained — "status@broadcast" and hyphenated legacy groups are valid —
+// so a real JID is never wrongly rejected, while anything with an unknown
+// server (123@foo.bar) fails HERE, locally, instead of leaking to the network
+// as a confusing server error. Deciding WHICH valid JIDs may be acted on is
+// policy (logic/), never this generic format gate.
+var jidPattern = regexp.MustCompile(
+	`^[^@\s]+@(s\.whatsapp\.net|lid|g\.us|newsletter|broadcast|c\.us|bot|msgr|interop|hosted|hosted\.lid)$`)
 
 func validateJID(jid string) error {
 	if !jidPattern.MatchString(jid) {

@@ -1,10 +1,9 @@
-module github.com/faisalsardi-dev/meowic
+module meowic
 
 go 1.25.0
 
 require (
 	github.com/mattn/go-sqlite3 v1.14.47
-	github.com/mdp/qrterminal/v3 v3.2.1
 	go.mau.fi/whatsmeow v0.0.0-20260709092057-73fe7355f59f
 	google.golang.org/protobuf v1.36.11
 )
@@ -27,7 +26,5 @@ require (
 	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/sys v0.46.0 // indirect
-	golang.org/x/term v0.44.0 // indirect
 	golang.org/x/text v0.38.0 // indirect
-	rsc.io/qr v0.2.0 // indirect
 )

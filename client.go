@@ -11,7 +11,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/faisalsardi-dev/meowic/actions"
+	"meowic/actions"
 )
 
 const usage = `usage: meowic <command> [args]
@@ -19,11 +19,12 @@ const usage = `usage: meowic <command> [args]
 commands:
   doctor
   get-newsletter-info <newsletter-jid>
-  list-newsletter-messages <newsletter-jid> [count]
+  list-newsletter-messages <newsletter-jid> [limit]
   get-group-info <group-jid>
+  get-person-info <person-jid>
   list-chats [limit]
   list-messages <chat-jid> [limit]
-  send-people <jid|number> <message...>`
+  send-message <jid> <message>`
 
 func main() {
 	os.Exit(run())
@@ -53,11 +54,13 @@ func run() int {
 		return Structure(actions.ListNewsletterMessages(args, m.ListNewsletterMessages))
 	case "get-group-info":
 		return Structure(actions.GetGroupInfo(args, m.GetGroupInfo))
+	case "get-person-info":
+		return Structure(actions.GetPersonInfo(args, m.GetPersonInfo))
 	case "list-chats":
 		return Structure(actions.ListChats(args, m.ListChats))
 	case "list-messages":
 		return Structure(actions.ListMessages(args, m.ListMessages))
-	case "send-people":
+	case "send-message":
 		return Structure(actions.SendMessage(args, m.SendText))
 	default:
 		return Structure(nil, fmt.Errorf("unknown command %q\n%s", cmd, usage))

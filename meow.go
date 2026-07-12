@@ -23,8 +23,8 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/faisalsardi-dev/meowic/logic"
-	"github.com/faisalsardi-dev/meowic/store"
+	"meowic/logic"
+	"meowic/store"
 )
 
 // Meow owns the whatsmeow client and the local stores.
@@ -60,7 +60,7 @@ func (m *Meow) Close() {
 	m.stores.Close()
 }
 
-func (m *Meow) HasSession() bool { return m.cli.Store.ID != nil }
+func (m *Meow) HasSession() bool  { return m.cli.Store.ID != nil }
 func (m *Meow) IsConnected() bool { return m.cli.IsConnected() }
 func (m *Meow) IsLoggedIn() bool  { return m.cli.IsLoggedIn() }
 
@@ -129,7 +129,6 @@ func digitsOf(s string) string {
 	return b.String()
 }
 
-
 func (m *Meow) afterFirstPair() {
 	// session.db holds plaintext auth material — lock it down.
 	_ = os.Chmod(m.stores.SessionDBPath(), 0o700)
@@ -160,11 +159,28 @@ func (m *Meow) SendText(to, text string) error {
 	if err := m.ensureConnected(); err != nil {
 		return err
 	}
-	_, err = m.cli.SendMessage(m.ctx, jid, &waE2E.Message{Conversation: proto.String(text)})
+	resp, err := m.cli.SendMessage(m.ctx, jid, &waE2E.Message{Conversation: proto.String(text)})
 	if err != nil {
 		return err
 	}
-	return m.stores.Messages.SetMeta("last_send", time.Now().UTC().Format(time.RFC3339))
+	// WhatsApp never echoes a device's own sends back to it, so without this
+	// the mirror would permanently miss messages sent through meowic — and an
+	// LLM that can't see its own sent messages may conclude they failed and
+	// resend. Record the confirmed send locally.
+	sender := ""
+	if m.cli.Store.ID != nil {
+		sender = m.cli.Store.ID.ToNonAD().String()
+	}
+	_ = m.stores.Messages.UpsertChat(jid.String(), "", resp.Timestamp)
+	_ = m.stores.Messages.InsertMessage(store.Message{
+		ID:        string(resp.ID),
+		ChatJID:   jid.String(),
+		SenderJID: sender,
+		FromMe:    true,
+		Timestamp: resp.Timestamp,
+		Text:      text,
+	})
+	return m.stores.Messages.SetMeta("last_send", resp.Timestamp.UTC().Format(time.RFC3339))
 }
 
 func (m *Meow) GetGroupInfo(jidStr string) (any, error) {
@@ -189,6 +205,10 @@ func (m *Meow) GetNewsletterInfo(jidStr string) (any, error) {
 	return m.cli.GetNewsletterInfo(m.ctx, jid)
 }
 
+// ListNewsletterMessages fetches a channel's recent posts live and reduces
+// each one through renderText — the same text-only rendering the mirror uses —
+// instead of dumping raw whatsmeow structs (base64 thumbnails, hashes, CDN
+// paths, message secrets) into the output.
 func (m *Meow) ListNewsletterMessages(jidStr string, count int) (any, error) {
 	jid, err := types.ParseJID(jidStr)
 	if err != nil {
@@ -197,7 +217,87 @@ func (m *Meow) ListNewsletterMessages(jidStr string, count int) (any, error) {
 	if err := m.ensureConnected(); err != nil {
 		return nil, err
 	}
-	return m.cli.GetNewsletterMessages(m.ctx, jid, &whatsmeow.GetNewsletterMessagesParams{Count: count})
+	msgs, err := m.cli.GetNewsletterMessages(m.ctx, jid, &whatsmeow.GetNewsletterMessagesParams{Count: count})
+	if err != nil {
+		return nil, err
+	}
+	type post struct {
+		ID        string         `json:"id"`
+		ServerID  int            `json:"server_id"`
+		Type      string         `json:"type"`
+		Timestamp time.Time      `json:"timestamp"`
+		Views     int            `json:"views"`
+		Reactions map[string]int `json:"reactions,omitempty"`
+		Text      string         `json:"text"`
+	}
+	posts := make([]post, 0, len(msgs))
+	for _, msg := range msgs {
+		posts = append(posts, post{
+			ID:        string(msg.MessageID),
+			ServerID:  int(msg.MessageServerID),
+			Type:      msg.Type,
+			Timestamp: msg.Timestamp,
+			Views:     msg.ViewsCount,
+			Reactions: msg.ReactionCounts,
+			Text:      renderText(msg.Message),
+		})
+	}
+	return posts, nil
+}
+
+// GetPersonInfo merges a live GetUserInfo lookup (status text, profile
+// picture presence, verified business name, LID linkage) with the local
+// contact store (is_contact only — no names or phone fields by design)
+// into one flat identity object for a person JID.
+func (m *Meow) GetPersonInfo(jidStr string) (any, error) {
+	jid, err := types.ParseJID(jidStr)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.ensureConnected(); err != nil {
+		return nil, err
+	}
+	infos, err := m.cli.GetUserInfo(m.ctx, []types.JID{jid})
+	if err != nil {
+		return nil, err
+	}
+	info := infos[jid]
+	// The contact store is keyed by phone JID, so a @lid lookup would always
+	// come back not-found even for a saved contact. Resolve the LID to its
+	// phone JID through the local LID map first (local store, no network).
+	contactJID := jid
+	if jid.Server == types.HiddenUserServer {
+		if pn, err := m.cli.Store.LIDs.GetPNForLID(m.ctx, jid); err == nil && pn.User != "" {
+			contactJID = pn
+		}
+	}
+	contact, err := m.cli.Store.Contacts.GetContact(m.ctx, contactJID)
+	if err != nil {
+		return nil, err
+	}
+	verified := ""
+	if info.VerifiedName != nil {
+		verified = info.VerifiedName.Details.GetVerifiedName()
+	}
+	lid := ""
+	if info.LID.User != "" {
+		lid = info.LID.String()
+	}
+	return struct {
+		JID          string `json:"jid"`
+		LID          string `json:"lid,omitempty"`
+		IsContact    bool   `json:"is_contact"`
+		Status       string `json:"status,omitempty"`
+		VerifiedName string `json:"verified_name,omitempty"`
+		HasImage     bool   `json:"has_image"`
+	}{
+		JID:          jid.String(),
+		LID:          lid,
+		IsContact:    contact.Found,
+		Status:       info.Status,
+		VerifiedName: verified,
+		HasImage:     info.PictureID != "",
+	}, nil
 }
 
 // ListChats and ListMessages read the local mirror only — no network.
@@ -233,9 +333,21 @@ func (m *Meow) handleEvent(evt any) {
 }
 
 func (m *Meow) storeMessage(e *events.Message, chatName string) {
-	text := textOf(e.Message)
+	// Chats table first, unconditionally: discovery (appearing in list-chats)
+	// is decoupled from message storage, so channels and media-only chats
+	// are listed even when nothing lands in the messages table.
+	_ = m.stores.Messages.UpsertChat(e.Info.Chat.String(), chatName, e.Info.Timestamp)
+
+	// Channels/newsletters are public server-side objects with their own live
+	// read path (list-newsletter-messages); mirroring them would create a
+	// second, divergent copy. Listed above, never stored below.
+	if e.Info.Chat.Server == types.NewsletterServer {
+		return
+	}
+
+	text := renderText(e.Message)
 	if text == "" {
-		return // text-only tool: media and other payloads are not mirrored
+		return // unrecognized payloads (polls, locations, ...) are not mirrored
 	}
 	_ = m.stores.Messages.InsertMessage(store.Message{
 		ID:        e.Info.ID,
@@ -245,17 +357,65 @@ func (m *Meow) storeMessage(e *events.Message, chatName string) {
 		Timestamp: e.Info.Timestamp,
 		Text:      text,
 	})
-	_ = m.stores.Messages.UpsertChat(e.Info.Chat.String(), chatName, e.Info.Timestamp)
 }
 
-func textOf(msg *waE2E.Message) string {
+// renderText reduces a message to the single text column of the mirror.
+// Plain text passes through; media becomes a text-only reference row —
+// a "[kind: metadata]" tag plus the caption, never any payload or path,
+// so the tool's text-only posture is unchanged.
+func renderText(msg *waE2E.Message) string {
 	if msg == nil {
 		return ""
 	}
 	if t := msg.GetConversation(); t != "" {
 		return t
 	}
-	return msg.GetExtendedTextMessage().GetText()
+	if t := msg.GetExtendedTextMessage().GetText(); t != "" {
+		return t
+	}
+	switch {
+	case msg.GetImageMessage() != nil:
+		img := msg.GetImageMessage()
+		return withCaption(fmt.Sprintf("[image: %s]", fmtSize(img.GetFileLength())), img.GetCaption())
+	case msg.GetVideoMessage() != nil:
+		vid := msg.GetVideoMessage()
+		return withCaption(fmt.Sprintf("[video: %s, %s]", fmtDur(vid.GetSeconds()), fmtSize(vid.GetFileLength())), vid.GetCaption())
+	case msg.GetAudioMessage() != nil:
+		aud := msg.GetAudioMessage()
+		kind := "audio"
+		if aud.GetPTT() {
+			kind = "voice note"
+		}
+		return fmt.Sprintf("[%s: %s, %s]", kind, fmtDur(aud.GetSeconds()), fmtSize(aud.GetFileLength()))
+	case msg.GetDocumentMessage() != nil:
+		doc := msg.GetDocumentMessage()
+		return withCaption(fmt.Sprintf("[document: %s, %s]", doc.GetFileName(), fmtSize(doc.GetFileLength())), doc.GetCaption())
+	case msg.GetStickerMessage() != nil:
+		return "[sticker]"
+	}
+	return ""
+}
+
+func withCaption(tag, caption string) string {
+	if caption == "" {
+		return tag
+	}
+	return tag + " " + caption
+}
+
+func fmtSize(bytes uint64) string {
+	switch {
+	case bytes >= 1<<20:
+		return fmt.Sprintf("%.1fMB", float64(bytes)/(1<<20))
+	case bytes >= 1<<10:
+		return fmt.Sprintf("%dKB", bytes/(1<<10))
+	default:
+		return fmt.Sprintf("%dB", bytes)
+	}
+}
+
+func fmtDur(seconds uint32) string {
+	return fmt.Sprintf("%dm%02ds", seconds/60, seconds%60)
 }
 
 // parseUserJID parses a full JID. Sends are JID-only and logic.CheckSend has

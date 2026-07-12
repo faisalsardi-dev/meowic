@@ -3,7 +3,7 @@ package actions
 import (
 	"errors"
 
-	"github.com/faisalsardi-dev/meowic/store"
+	"meowic/store"
 )
 
 // ListMessages reads locally synced messages for one chat. No network access.

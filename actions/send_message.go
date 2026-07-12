@@ -15,11 +15,11 @@ import (
 // may be messaged live in logic/ and are enforced downstream, keeping actions/
 // reusable across other Go builds without changing a line here.
 func SendMessage(args []string, send func(to, text string) error) (any, error) {
-	if len(args) < 2 {
-		return nil, errors.New("usage: send-people <jid> <message...>")
+	if len(args) != 2 {
+		return nil, errors.New(`usage: send-message <jid> <message> (quote the message: "hello there")`)
 	}
 	to := args[0]
-	text := strings.Join(args[1:], " ")
+	text := args[1]
 	if err := validateJID(to); err != nil {
 		return nil, err
 	}

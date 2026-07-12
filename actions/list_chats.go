@@ -1,7 +1,7 @@
 package actions
 
 import (
-	"github.com/faisalsardi-dev/meowic/store"
+	"meowic/store"
 )
 
 // ListChats reads the locally synced chat list. No network access.
