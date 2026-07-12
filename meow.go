@@ -7,6 +7,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -144,9 +145,10 @@ func (m *Meow) afterFirstPair() {
 func (m *Meow) ensureConnected() error { return m.Connect() }
 
 // SendText sends a plain text message to an individual contact.
-// The group-send rule lives in logic/ and is checked by send_people.go
-// before this function is reached; it is re-checked here so no future
-// caller inside this codebase can route around it.
+// The send restrictions live in logic/ and are enforced here — this is the
+// single choke point every send passes through, before any network I/O.
+// The actions/ layer stays generic (input-shape validation only) and does
+// not apply any rule, so it can be reused by toolsets with other policies.
 func (m *Meow) SendText(to, text string) error {
 	if err := logic.CheckSend(to); err != nil {
 		return err
@@ -256,10 +258,10 @@ func textOf(msg *waE2E.Message) string {
 	return msg.GetExtendedTextMessage().GetText()
 }
 
+// parseUserJID parses a full JID. Sends are JID-only and logic.CheckSend has
+// already required an "@s.whatsapp.net" suffix by the time we get here, so
+// there is no bare-number normalization to do — the string always has a server.
 func parseUserJID(s string) (types.JID, error) {
-	if !strings.ContainsRune(s, '@') {
-		s += "@" + types.DefaultUserServer
-	}
 	return types.ParseJID(s)
 }
 
@@ -276,12 +278,17 @@ func Structure(data any, err error) int {
 	if err != nil {
 		env.Error = err.Error()
 	}
-	out, marshalErr := json.MarshalIndent(env, "", "  ")
-	if marshalErr != nil {
-		fmt.Printf("{\"ok\":false,\"error\":%q}\n", marshalErr.Error())
+	// A plain encoder (not json.MarshalIndent) so SetEscapeHTML(false) keeps
+	// <, > and & literal in error strings instead of <-style escapes.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if encErr := enc.Encode(env); encErr != nil {
+		fmt.Printf("{\"ok\":false,\"error\":%q}\n", encErr.Error())
 		return 1
 	}
-	fmt.Println(string(out))
+	fmt.Print(buf.String()) // Encode already appends a trailing newline
 	if err != nil {
 		return 1
 	}

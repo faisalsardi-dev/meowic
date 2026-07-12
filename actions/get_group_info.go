@@ -1,4 +1,4 @@
-package commands
+package actions
 
 import "errors"
 
@@ -7,6 +7,9 @@ import "errors"
 func GetGroupInfo(args []string, fetch func(jid string) (any, error)) (any, error) {
 	if len(args) != 1 {
 		return nil, errors.New("usage: get-group-info <group-jid>")
+	}
+	if err := validateJID(args[0]); err != nil {
+		return nil, err
 	}
 	return fetch(args[0])
 }

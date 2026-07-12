@@ -4,3 +4,6 @@
 # built binary
 /meowic
 .DS_Store
+
+# local-only dev notes / scratch (admin.txt lives here)
+/dev/

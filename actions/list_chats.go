@@ -1,4 +1,4 @@
-package commands
+package actions
 
 import (
 	"github.com/faisalsardi-dev/meowic/store"

@@ -1,4 +1,4 @@
-package commands
+package actions
 
 import (
 	"errors"
@@ -10,6 +10,9 @@ import (
 func ListMessages(args []string, list func(chatJID string, limit int) ([]store.Message, error)) (any, error) {
 	if len(args) < 1 {
 		return nil, errors.New("usage: list-messages <chat-jid> [limit]")
+	}
+	if err := validateJID(args[0]); err != nil {
+		return nil, err
 	}
 	limit, err := optionalLimit(args, 1, 50)
 	if err != nil {

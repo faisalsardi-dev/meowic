@@ -1,5 +1,5 @@
 // client.go is routing only: parse os.Args, hand off to the right
-// commands/ function, print via Structure. No whatsmeow imports, no
+// actions/ function, print via Structure. No whatsmeow imports, no
 // business logic.
 package main
 
@@ -11,7 +11,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/faisalsardi-dev/meowic/commands"
+	"github.com/faisalsardi-dev/meowic/actions"
 )
 
 const usage = `usage: meowic <command> [args]
@@ -48,17 +48,17 @@ func run() int {
 	case "doctor":
 		return Structure(HealthReport(m))
 	case "get-newsletter-info":
-		return Structure(commands.GetNewsletterInfo(args, m.GetNewsletterInfo))
+		return Structure(actions.GetNewsletterInfo(args, m.GetNewsletterInfo))
 	case "list-newsletter-messages":
-		return Structure(commands.ListNewsletterMessages(args, m.ListNewsletterMessages))
+		return Structure(actions.ListNewsletterMessages(args, m.ListNewsletterMessages))
 	case "get-group-info":
-		return Structure(commands.GetGroupInfo(args, m.GetGroupInfo))
+		return Structure(actions.GetGroupInfo(args, m.GetGroupInfo))
 	case "list-chats":
-		return Structure(commands.ListChats(args, m.ListChats))
+		return Structure(actions.ListChats(args, m.ListChats))
 	case "list-messages":
-		return Structure(commands.ListMessages(args, m.ListMessages))
+		return Structure(actions.ListMessages(args, m.ListMessages))
 	case "send-people":
-		return Structure(commands.SendPeople(args, m.SendText))
+		return Structure(actions.SendMessage(args, m.SendText))
 	default:
 		return Structure(nil, fmt.Errorf("unknown command %q\n%s", cmd, usage))
 	}
