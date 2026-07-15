@@ -14,7 +14,7 @@ import (
 // text is non-empty). It applies no policy — restrictions such as which JIDs
 // may be messaged live in logic/ and are enforced downstream, keeping actions/
 // reusable across other Go builds without changing a line here.
-func SendMessage(args []string, send func(to, text string) error) (any, error) {
+func SendMessage(args []string, send func(to, text string) (string, error)) (any, error) {
 	if len(args) != 2 {
 		return nil, errors.New(`usage: send-message <jid> <message> (quote the message: "hello there")`)
 	}
@@ -26,8 +26,13 @@ func SendMessage(args []string, send func(to, text string) error) (any, error) {
 	if strings.TrimSpace(text) == "" {
 		return nil, errors.New("message text must not be empty")
 	}
-	if err := send(to, text); err != nil {
+	warning, err := send(to, text)
+	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"status": "sent", "to": to}, nil
+	res := map[string]any{"status": "sent", "to": to}
+	if warning != "" {
+		res["warning"] = warning
+	}
+	return res, nil
 }

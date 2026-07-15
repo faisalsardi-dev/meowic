@@ -1,0 +1,21 @@
+{
+  "name": "meowic-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local MCP wrapper that execs the compiled meowic WhatsApp CLI (never imports its packages).",
+  "type": "module",
+  "bin": {
+    "meowic-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "^5.9.3"
+  }
+}

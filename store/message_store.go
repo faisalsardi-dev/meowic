@@ -86,6 +86,20 @@ func (s *MessageStore) InsertMessage(m Message) error {
 	return err
 }
 
+// DeleteMessage removes a mirrored message by (chat, id). Used when the other
+// party revokes (deletes for everyone); a no-op if the row was never mirrored.
+func (s *MessageStore) DeleteMessage(chatJID, id string) error {
+	_, err := s.db.Exec(`DELETE FROM messages WHERE chat_jid = ? AND id = ?`, chatJID, id)
+	return err
+}
+
+// UpdateMessageText replaces the text of a mirrored message by (chat, id).
+// Used when the other party edits a message; a no-op if the row is absent.
+func (s *MessageStore) UpdateMessageText(chatJID, id, text string) error {
+	_, err := s.db.Exec(`UPDATE messages SET text = ? WHERE chat_jid = ? AND id = ?`, text, chatJID, id)
+	return err
+}
+
 func (s *MessageStore) ListChats(limit int) ([]Chat, error) {
 	rows, err := s.db.Query(`
 		SELECT jid, name, last_message_time FROM chats

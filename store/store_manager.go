@@ -29,6 +29,12 @@ func Open(ctx context.Context) (*Manager, error) {
 		session.Close()
 		return nil, err
 	}
+	// Lock down the on-disk material on EVERY run, not just at first pairing:
+	// session.db holds plaintext auth keys, messages.db holds mirrored content.
+	// Both files exist by now (the opens above create them). Best-effort.
+	_ = os.Chmod(DataDir, 0o700)
+	_ = os.Chmod(filepath.Join(DataDir, "session.db"), 0o600)
+	_ = os.Chmod(filepath.Join(DataDir, "messages.db"), 0o600)
 	return &Manager{Session: session, Messages: messages}, nil
 }
 

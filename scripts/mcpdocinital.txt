@@ -1,0 +1,69 @@
+8 commands (1 setup/status - 6 read - 1 write)
+=============================================================
+- doctor
+    Args: none
+    Returns: health report — connected, logged_in, session_exists, store
+             paths, chat/message counts, last_sync/last_send.
+
+- list-chats
+    Args: [limit]  (default 50)
+    Returns: array of { jid, name, last_message_time }, newest first.
+
+- list-messages
+    Args: <chat-jid> (required), [limit] (default 50)
+    Returns: array of { id, chat_jid, sender_jid, from_me, timestamp, text },
+             newest first. Includes channel/newsletter posts too.
+
+- get-group-info
+    Args: <group-jid> (exactly one)
+    Returns: group metadata.
+
+- get-newsletter-info
+    Args: <newsletter-jid> (exactly one)
+    Returns: newsletter metadata.
+
+- list-newsletter-messages
+    Args: <newsletter-jid> (required), [limit] (default 50)
+    Returns: array of newsletter messages (live backup; posts are also mirrored
+             into list-messages).
+
+- get-person-info
+    Args: <person-jid> (exactly one)
+    Returns: { jid, found, lid, is_contact, status, verified_name, has_image }.
+             found=false means WhatsApp returned no info for the JID.
+             Resolves a @lid to its phone JID before the contact lookup.
+
+- send-message
+    Args: <jid> <message>  — a FULL JID and the text, exactly two arguments.
+    Returns: { status: "sent", to }, plus an optional "warning".
+=================================================================
+notes:
+- send-message takes a full JID only (no bare-number resolution). A person's
+  number 966500000000 must be written as 966500000000@s.whatsapp.net.
+- Sending is allowed ONLY to individuals: @s.whatsapp.net and @lid.
+- send-message is NOT idempotent: if it times out or errors, do NOT auto-retry
+  (it may have already delivered) — check list-messages first. A success may
+  carry a "warning" (e.g. mirror write failed); it still sent, do not resend.
+- Every command prints JSON on stdout.
+- Reads accept any valid JID.
+- Any optional [limit] must be a positive integer (default 50) and at most 200,
+  otherwise the command errors ("limit must be a positive integer" / "at most 200").
+- doctor is the overall check-up: one call reports connection, login, session,
+  store paths, chat/message counts, and last sync/send — a snapshot of whether
+  everything is healthy. It also doubles as a connection resync: running it
+  connects, so new messages pull into the local mirror (and the first run
+  triggers pairing).
+
+A JID's suffix tells you its kind:
+All 11 known WhatsApp servers (according to whatsmeow)
+  - @s.whatsapp.net -> individual person, addressed by phone number (sendable)
+  - @lid            -> individual person with a HIDDEN number ("Linked ID" privacy addressing; sendable)
+  - @g.us           -> group chat (not sendable, refused per rules)
+  - @newsletter     -> channel / newsletter (read live via list-newsletter-messages AND mirrored in list-messages; not sendable)
+  - @broadcast      -> broadcast list or Status; "status@broadcast" is the Status/Stories feed
+  - @c.us           -> legacy user server (pre-multidevice; some official/PSA accounts)
+  - @bot            -> bot accounts, e.g. Meta AI
+  - @msgr           -> Messenger interop (Meta cross-app w/ Facebook Messenger)     [uncommon; lower confidence]
+  - @interop        -> third-party messaging interoperability (EU DMA cross-app)    [uncommon; lower confidence]
+  - @hosted         -> hosted account (server/cloud-hosted; likely Business API)    [rare; lower confidence]
+  - @hosted.lid     -> hosted account with hidden-number (LID) addressing           [rare; lower confidence]

@@ -87,10 +87,19 @@ func (m *Meow) Connect() error {
 // JSON-only), requests an 8-character linking code from WhatsApp, and
 // blocks until the code is entered on the phone or the window times out.
 func (m *Meow) pairAndConnect() error {
+	// Pairing is interactive: it prompts for a phone number on stdin and needs
+	// a human to type a linking code on the phone. Refuse to start it when
+	// stdin is not a terminal — under the MCP wrapper (or any pipe) stdin is
+	// never fed, so prompting would just block until the caller's timeout, and
+	// piped bytes could be misread as a phone number and request a real code.
+	// Fail closed with a clear message instead; pairing is a one-time terminal step.
+	if stat, err := os.Stdin.Stat(); err != nil || stat.Mode()&os.ModeCharDevice == 0 {
+		return errors.New("no session found and stdin is not a terminal — pairing is a one-time interactive step: run ./meowic doctor in a terminal to pair")
+	}
 	if err := m.cli.Connect(); err != nil {
 		return err
 	}
-	fmt.Fprint(os.Stderr, "no session found — enter this account's phone number in international format (e.g. 15551234567): ")
+	fmt.Fprint(os.Stderr, "no session found — enter this account's phone number in international format (e.g. 15551234567 or 966512345678): ")
 	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 	if err != nil {
 		return fmt.Errorf("reading phone number: %w", err)
@@ -130,8 +139,9 @@ func digitsOf(s string) string {
 }
 
 func (m *Meow) afterFirstPair() {
-	// session.db holds plaintext auth material — lock it down.
-	_ = os.Chmod(m.stores.SessionDBPath(), 0o700)
+	// session.db holds plaintext auth material — lock it down (store.Open also
+	// does this on every run; keep it here so it applies the moment we pair).
+	_ = os.Chmod(m.stores.SessionDBPath(), 0o600)
 	fmt.Fprintln(os.Stderr, "paired successfully — waiting for the initial history sync...")
 	// Initial history sync arrives as events shortly after pairing;
 	// give it a window before the process exits and drops the connection.
@@ -143,46 +153,86 @@ func (m *Meow) afterFirstPair() {
 
 func (m *Meow) ensureConnected() error { return m.Connect() }
 
+// opCtx bounds a single network operation so one hung request can't consume the
+// whole caller budget (the MCP wrapper's exec timeout). Pairing is exempt — it
+// uses m.ctx directly for its own multi-minute linking-code window.
+func (m *Meow) opCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(m.ctx, 30*time.Second)
+}
+
+// readOnly reports whether the runtime read-only switch is engaged
+// (env MEOWIC_READONLY set to anything other than "" / "0" / "false").
+// Unlike the logic/ send policy — which is compile-time and immovable — this
+// is a runtime flag by design, but it can only ever TIGHTEN: it disables the
+// single write entirely and can never loosen who may be messaged. Reads are
+// unaffected (they never reach SendText).
+func readOnly() bool {
+	v := strings.ToLower(os.Getenv("MEOWIC_READONLY"))
+	return v != "" && v != "0" && v != "false"
+}
+
 // SendText sends a plain text message to an individual contact.
 // The send restrictions live in logic/ and are enforced here — this is the
 // single choke point every send passes through, before any network I/O.
+// A runtime read-only switch (MEOWIC_READONLY) is checked first: when set it
+// blocks every send, a level that can only clamp further, never loosen logic/.
 // The actions/ layer stays generic (input-shape validation only) and does
 // not apply any rule, so it can be reused by toolsets with other policies.
-func (m *Meow) SendText(to, text string) error {
+// SendText returns a non-fatal warning string alongside the error: the send
+// itself is irreversible, so a failure to record the confirmed send in the
+// local mirror must NOT be reported as a send error (that would invite a
+// resend). Instead it comes back as a warning the caller surfaces to the LLM.
+func (m *Meow) SendText(to, text string) (warning string, err error) {
+	if readOnly() {
+		return "", errors.New("read-only mode: sending is disabled (MEOWIC_READONLY is set)")
+	}
 	if err := logic.CheckSend(to); err != nil {
-		return err
+		return "", err
 	}
 	jid, err := parseUserJID(to)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err := m.ensureConnected(); err != nil {
-		return err
+		return "", err
 	}
-	resp, err := m.cli.SendMessage(m.ctx, jid, &waE2E.Message{Conversation: proto.String(text)})
+	ctx, cancel := m.opCtx()
+	defer cancel()
+	resp, err := m.cli.SendMessage(ctx, jid, &waE2E.Message{Conversation: proto.String(text)})
 	if err != nil {
-		return err
+		return "", err
 	}
 	// WhatsApp never echoes a device's own sends back to it, so without this
 	// the mirror would permanently miss messages sent through meowic — and an
 	// LLM that can't see its own sent messages may conclude they failed and
-	// resend. Record the confirmed send locally.
+	// resend. Record the confirmed send locally. If that write fails the send
+	// still happened: warn (so the LLM won't resend on a missing echo) rather
+	// than error.
 	sender := ""
 	if m.cli.Store.ID != nil {
 		sender = m.cli.Store.ID.ToNonAD().String()
 	}
 	_ = m.stores.Messages.UpsertChat(jid.String(), "", resp.Timestamp)
-	_ = m.stores.Messages.InsertMessage(store.Message{
+	if werr := m.stores.Messages.InsertMessage(store.Message{
 		ID:        string(resp.ID),
 		ChatJID:   jid.String(),
 		SenderJID: sender,
 		FromMe:    true,
 		Timestamp: resp.Timestamp,
 		Text:      text,
-	})
-	return m.stores.Messages.SetMeta("last_send", resp.Timestamp.UTC().Format(time.RFC3339))
+	}); werr != nil {
+		warning = "message was sent, but recording it in the local mirror failed; it may not appear in list-messages — do NOT resend"
+	}
+	_ = m.stores.Messages.SetMeta("last_send", resp.Timestamp.UTC().Format(time.RFC3339))
+	return warning, nil
 }
 
+// GetGroupInfo returns a reduced view of a group's metadata. The raw
+// whatsmeow *types.GroupInfo is deliberately NOT returned: it carries the
+// owner's phone number and, per participant, BOTH the phone number and the
+// LID — a hidden-number cross-link the text-only posture must not leak into
+// output. Only vetted, non-cross-linking fields are emitted; each participant
+// is reduced to its primary addressing JID plus admin flags.
 func (m *Meow) GetGroupInfo(jidStr string) (any, error) {
 	jid, err := types.ParseJID(jidStr)
 	if err != nil {
@@ -191,9 +241,58 @@ func (m *Meow) GetGroupInfo(jidStr string) (any, error) {
 	if err := m.ensureConnected(); err != nil {
 		return nil, err
 	}
-	return m.cli.GetGroupInfo(m.ctx, jid)
+	ctx, cancel := m.opCtx()
+	defer cancel()
+	gi, err := m.cli.GetGroupInfo(ctx, jid)
+	if err != nil {
+		return nil, err
+	}
+	type participant struct {
+		JID          string `json:"jid"`
+		IsAdmin      bool   `json:"is_admin"`
+		IsSuperAdmin bool   `json:"is_super_admin"`
+	}
+	parts := make([]participant, 0, len(gi.Participants))
+	for _, p := range gi.Participants {
+		parts = append(parts, participant{
+			JID:          p.JID.String(),
+			IsAdmin:      p.IsAdmin,
+			IsSuperAdmin: p.IsSuperAdmin,
+		})
+	}
+	count := gi.ParticipantCount
+	if count == 0 {
+		count = len(gi.Participants)
+	}
+	return struct {
+		JID              string        `json:"jid"`
+		Name             string        `json:"name"`
+		Topic            string        `json:"topic,omitempty"`
+		Created          time.Time     `json:"created"`
+		IsAnnounce       bool          `json:"is_announce"`  // only admins may post
+		IsLocked         bool          `json:"is_locked"`    // only admins may edit settings
+		IsEphemeral      bool          `json:"is_ephemeral"` // disappearing messages on
+		IsCommunity      bool          `json:"is_community"` // a community parent group
+		ParticipantCount int           `json:"participant_count"`
+		Participants     []participant `json:"participants"`
+	}{
+		JID:              gi.JID.String(),
+		Name:             gi.Name,
+		Topic:            gi.Topic,
+		Created:          gi.GroupCreated,
+		IsAnnounce:       gi.IsAnnounce,
+		IsLocked:         gi.IsLocked,
+		IsEphemeral:      gi.IsEphemeral,
+		IsCommunity:      gi.IsParent,
+		ParticipantCount: count,
+		Participants:     parts,
+	}, nil
 }
 
+// GetNewsletterInfo returns a reduced view of a channel's metadata. As with
+// GetGroupInfo, the raw *types.NewsletterMetadata is NOT returned: it carries
+// the invite code (a shareable join link) and profile-picture CDN URLs, which
+// the text-only posture withholds. Only vetted fields are emitted.
 func (m *Meow) GetNewsletterInfo(jidStr string) (any, error) {
 	jid, err := types.ParseJID(jidStr)
 	if err != nil {
@@ -202,13 +301,44 @@ func (m *Meow) GetNewsletterInfo(jidStr string) (any, error) {
 	if err := m.ensureConnected(); err != nil {
 		return nil, err
 	}
-	return m.cli.GetNewsletterInfo(m.ctx, jid)
+	ctx, cancel := m.opCtx()
+	defer cancel()
+	nm, err := m.cli.GetNewsletterInfo(ctx, jid)
+	if err != nil {
+		return nil, err
+	}
+	role := ""
+	muted := false
+	if nm.ViewerMeta != nil {
+		role = string(nm.ViewerMeta.Role)
+		muted = nm.ViewerMeta.Mute == types.NewsletterMuteOn
+	}
+	return struct {
+		JID             string    `json:"jid"`
+		Name            string    `json:"name"`
+		Description     string    `json:"description,omitempty"`
+		SubscriberCount int       `json:"subscriber_count"`
+		Verified        bool      `json:"verified"`
+		Created         time.Time `json:"created"`
+		Role            string    `json:"role,omitempty"`
+		Muted           bool      `json:"muted"`
+	}{
+		JID:             nm.ID.String(),
+		Name:            nm.ThreadMeta.Name.Text,
+		Description:     nm.ThreadMeta.Description.Text,
+		SubscriberCount: nm.ThreadMeta.SubscriberCount,
+		Verified:        nm.ThreadMeta.VerificationState == types.NewsletterVerificationStateVerified,
+		Created:         nm.ThreadMeta.CreationTime.Time,
+		Role:            role,
+		Muted:           muted,
+	}, nil
 }
 
-// ListNewsletterMessages fetches a channel's recent posts live and reduces
-// each one through renderText — the same text-only rendering the mirror uses —
-// instead of dumping raw whatsmeow structs (base64 thumbnails, hashes, CDN
-// paths, message secrets) into the output.
+// ListNewsletterMessages fetches a channel's recent posts live — the backup
+// read path for channels now that storeMessage also mirrors them into
+// messages.db (list-messages). It reduces each post through renderText — the
+// same text-only rendering the mirror uses — instead of dumping raw whatsmeow
+// structs (base64 thumbnails, hashes, CDN paths, message secrets) into output.
 func (m *Meow) ListNewsletterMessages(jidStr string, count int) (any, error) {
 	jid, err := types.ParseJID(jidStr)
 	if err != nil {
@@ -217,7 +347,9 @@ func (m *Meow) ListNewsletterMessages(jidStr string, count int) (any, error) {
 	if err := m.ensureConnected(); err != nil {
 		return nil, err
 	}
-	msgs, err := m.cli.GetNewsletterMessages(m.ctx, jid, &whatsmeow.GetNewsletterMessagesParams{Count: count})
+	ctx, cancel := m.opCtx()
+	defer cancel()
+	msgs, err := m.cli.GetNewsletterMessages(ctx, jid, &whatsmeow.GetNewsletterMessagesParams{Count: count})
 	if err != nil {
 		return nil, err
 	}
@@ -257,11 +389,23 @@ func (m *Meow) GetPersonInfo(jidStr string) (any, error) {
 	if err := m.ensureConnected(); err != nil {
 		return nil, err
 	}
-	infos, err := m.cli.GetUserInfo(m.ctx, []types.JID{jid})
+	ctx, cancel := m.opCtx()
+	defer cancel()
+	infos, err := m.cli.GetUserInfo(ctx, []types.JID{jid})
 	if err != nil {
 		return nil, err
 	}
-	info := infos[jid]
+	// whatsmeow may key the response by a normalized JID rather than the exact
+	// query JID; fall back to the sole returned entry so a real identity isn't
+	// mistaken for not-found. found=false distinguishes "WhatsApp returned
+	// nothing" from a genuine but blank profile.
+	info, found := infos[jid]
+	if !found && len(infos) == 1 {
+		for _, v := range infos {
+			info = v
+			found = true
+		}
+	}
 	// The contact store is keyed by phone JID, so a @lid lookup would always
 	// come back not-found even for a saved contact. Resolve the LID to its
 	// phone JID through the local LID map first (local store, no network).
@@ -285,6 +429,7 @@ func (m *Meow) GetPersonInfo(jidStr string) (any, error) {
 	}
 	return struct {
 		JID          string `json:"jid"`
+		Found        bool   `json:"found"`
 		LID          string `json:"lid,omitempty"`
 		IsContact    bool   `json:"is_contact"`
 		Status       string `json:"status,omitempty"`
@@ -292,6 +437,7 @@ func (m *Meow) GetPersonInfo(jidStr string) (any, error) {
 		HasImage     bool   `json:"has_image"`
 	}{
 		JID:          jid.String(),
+		Found:        found,
 		LID:          lid,
 		IsContact:    contact.Found,
 		Status:       info.Status,
@@ -333,21 +479,40 @@ func (m *Meow) handleEvent(evt any) {
 }
 
 func (m *Meow) storeMessage(e *events.Message, chatName string) {
+	// Revokes (delete-for-everyone) and edits arrive as protocol messages that
+	// target an EARLIER message by ID. Keep the mirror honest: drop the row on a
+	// revoke, replace its text on an edit — otherwise the LLM keeps reading
+	// content the other party has since deleted or changed. Handled before the
+	// chat upsert so a revoke/edit never resurfaces or creates a chat row.
+	// (Historical edits from a history sync arrive already resolved to their
+	// final content via ParseWebMessage, so they take the normal insert path.)
+	if pm := e.Message.GetProtocolMessage(); pm != nil {
+		switch pm.GetType() {
+		case waE2E.ProtocolMessage_REVOKE:
+			if id := pm.GetKey().GetID(); id != "" {
+				_ = m.stores.Messages.DeleteMessage(e.Info.Chat.String(), id)
+			}
+		case waE2E.ProtocolMessage_MESSAGE_EDIT:
+			id := pm.GetKey().GetID()
+			if text := renderText(pm.GetEditedMessage()); id != "" && text != "" {
+				_ = m.stores.Messages.UpdateMessageText(e.Info.Chat.String(), id, text)
+			}
+		}
+		return // no protocol message carries a new chat-content row of its own
+	}
+
 	// Chats table first, unconditionally: discovery (appearing in list-chats)
 	// is decoupled from message storage, so channels and media-only chats
 	// are listed even when nothing lands in the messages table.
 	_ = m.stores.Messages.UpsertChat(e.Info.Chat.String(), chatName, e.Info.Timestamp)
 
-	// Channels/newsletters are public server-side objects with their own live
-	// read path (list-newsletter-messages); mirroring them would create a
-	// second, divergent copy. Listed above, never stored below.
-	if e.Info.Chat.Server == types.NewsletterServer {
-		return
-	}
-
+	// Channels/newsletters are mirrored like any other chat so list-messages
+	// surfaces them offline; list-newsletter-messages stays as the live backup
+	// read path. (Earlier this early-returned to avoid a second copy; the user
+	// reversed that — a local mirror of channel posts is now wanted.)
 	text := renderText(e.Message)
 	if text == "" {
-		return // unrecognized payloads (polls, locations, ...) are not mirrored
+		return // pure signalling (reactions, revokes/edits) leaves no row
 	}
 	_ = m.stores.Messages.InsertMessage(store.Message{
 		ID:        e.Info.ID,
@@ -393,7 +558,15 @@ func renderText(msg *waE2E.Message) string {
 	case msg.GetStickerMessage() != nil:
 		return "[sticker]"
 	}
-	return ""
+	// Pure signalling payloads carry no standalone content and are meant to
+	// leave no row: reactions, and protocol messages (revokes, edits, history
+	// sync control). Everything else is a real message we simply don't model
+	// yet (polls, locations, contact cards, ...) — mark it so the LLM sees a
+	// message existed instead of an invisible gap, without storing any payload.
+	if msg.GetReactionMessage() != nil || msg.GetProtocolMessage() != nil {
+		return ""
+	}
+	return "[unsupported message]"
 }
 
 func withCaption(tag, caption string) string {
@@ -419,8 +592,9 @@ func fmtDur(seconds uint32) string {
 }
 
 // parseUserJID parses a full JID. Sends are JID-only and logic.CheckSend has
-// already required an "@s.whatsapp.net" suffix by the time we get here, so
-// there is no bare-number normalization to do — the string always has a server.
+// already required an "@s.whatsapp.net" or "@lid" suffix by the time we get
+// here, so there is no bare-number normalization to do — the string always has
+// a server, and types.ParseJID handles both individual servers.
 func parseUserJID(s string) (types.JID, error) {
 	return types.ParseJID(s)
 }

@@ -30,7 +30,18 @@ func main() {
 	os.Exit(run())
 }
 
-func run() int {
+func run() (code int) {
+	// Last-resort guard so the "always emit a JSON envelope on stdout"
+	// contract survives an unexpected panic: without this a panic would print
+	// a stack trace to stderr, leave stdout empty, and exit non-zero — which
+	// the MCP wrapper can only log as vague "no output". Recover, emit a
+	// proper error envelope, and set the exit code through the named return.
+	defer func() {
+		if r := recover(); r != nil {
+			code = Structure(nil, fmt.Errorf("internal error: %v", r))
+		}
+	}()
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

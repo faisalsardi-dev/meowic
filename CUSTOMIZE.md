@@ -1,9 +1,14 @@
-# whatsapp-cli — Customization Reference
+# meowic — Customization Reference
 
-This document is an archived reference for how this tool's capabilities are
-selected and restricted. It exists so that, months from now, it's clear
-*why* the shipped version looks the way it does, and how to reshape it for
-a different use case without re-deriving the whole design from scratch.
+This document is the **menu**. It exists so that, months from now, it's clear
+*why* the shipped tool looks the way it does — and so a different build can be
+assembled without re-deriving the whole design. Two things are on the menu:
+
+1. **The whatsmeow actions you can choose from** (Section 1) — the full universe
+   of capability, of which meowic exposes only a selected subset.
+2. **The custom `logic/` rules you can bake in** (Section 2) — hardcoded,
+   compile-time restrictions on the commands you *do* ship (e.g. auto-block
+   foreign numbers, work-hours-only, disallow non-people).
 
 ---
 
@@ -12,9 +17,10 @@ a different use case without re-deriving the whole design from scratch.
 Everything this tool can possibly do comes from one library: `whatsmeow`
 (`go.mau.fi/whatsmeow`). Nothing is implemented outside of what that
 library exposes — there is no custom protocol work, no reimplementation.
-Below is the complete public API surface, organized by category
-(excluding ~150 methods under `DangerousInternalClient`, which are raw,
-unexported protocol internals not meant for normal use).
+Below is the public API surface, organized by category (excluding ~150
+methods under `DangerousInternalClient`, which are raw, unexported protocol
+internals not meant for normal use). Treat this as an illustrative snapshot,
+not a line-by-line audit of the current whatsmeow release.
 
 ```
 AUTH / CONNECTION
@@ -103,7 +109,6 @@ MINIMAL SUBSET LIKELY NEEDED FOR A TYPICAL CLI:
   Connect() / PairPhone()       -> auth
   AddEventHandler()             -> receive messages
   SendMessage()                 -> send text
-  Download() / DownloadToFile() -> media in (quarantine folder)
   GetUserInfo() / IsOnWhatsApp()-> contact lookup
   GetGroupInfo() / GetJoinedGroups() -> read-only group info
 ```
@@ -130,8 +135,14 @@ into the code path, independent of any config file or environment
 variable. This is for cases where you want the command to broadly work,
 but with specific, non-negotiable exceptions.
 
+> **A note on the MCP wrapper.** `mcp/` is effectively a third selection
+> point: it chooses which of the binary's commands to surface as MCP tools.
+> But the binary is the real boundary — a command that exists in the binary
+> is still runnable from the CLI even if the wrapper doesn't expose it. Only
+> Layer 1 (no command at all) is absolute.
+
 ### The variant shipped in this project
-- `send` is enabled, always on — no feature flag gating it.
+- `send-message` is enabled, always on — no feature flag gating it.
 - `edit` was considered, then removed entirely (Layer 1) — not worth the
   added surface for a tool used this lightly.
 - Media/file-sending was considered and rejected outright (Layer 1) —
@@ -140,14 +151,17 @@ but with specific, non-negotiable exceptions.
   `whatsapp-cli`'s `send --image`, both accept arbitrary local file
   paths with no confinement). No file-path parameter exists anywhere in
   this codebase as a result.
-- **Layer 2 rule**: `send` refuses any JID ending in `@g.us` (WhatsApp's
-  suffix for groups). This is a hardcoded check inside the send path
-  itself (`logic/disallow_sending_to_groups.go`), not a flag — sending
-  to groups requires editing and recompiling the source, a deliberately
-  high-friction action.
+- **Layer 2 rule**: `send-message` enforces an **allowlist** in
+  `logic/sending_messages_only_to_people.go`. `CheckSend` permits only
+  individual JIDs — `@s.whatsapp.net` and `@lid` — and refuses everything
+  else (groups `@g.us`, channels `@newsletter`, bare numbers, and any future
+  address type) with `message sending is only allowed to people`. An
+  allowlist can't silently miss a "bad" suffix the way a denylist can.
+  Changing it requires editing this file and recompiling — a deliberately
+  high-friction action, never a flag.
 
 > **Caveat — `Logout()` and connection-lifecycle actions are deliberately
-> absent from `commands/`.** Looking at the Section 1 list, `Logout()`,
+> absent from `actions/`.** Looking at the Section 1 list, `Logout()`,
 > `Disconnect()`, and `PairPhone()` all live under AUTH/CONNECTION, and
 > it may look like an oversight that none of them became a CLI command.
 > This is intentional, not a gap: unlinking the device (`Logout()`) is a
@@ -163,55 +177,71 @@ but with specific, non-negotiable exceptions.
 > needs any of these exposed, treat it the same as any other Layer 1
 > decision: a deliberate, individually-considered choice, not a default.
 
-### Two other believable variants (not shipped, illustrative only)
+### Other variants (not shipped, illustrative only)
 
 **A. "Work hours only" bot** — a variant aimed at a small-business use
-case. `send` stays enabled (Layer 1), but a Layer 2 rule rejects any
+case. `send-message` stays enabled (Layer 1), but a Layer 2 rule rejects any
 send attempt outside 9am–6pm in the account owner's local timezone,
 regardless of who's asking or why — preventing an LLM (or anyone) from
 firing off messages at 3am.
 
 **B. "VIP contacts only" assistant** — a variant for someone who only
 wants an LLM replying to a short list of close contacts, never anyone
-else. `send` is enabled (Layer 1), and a Layer 2 rule checks the
+else. `send-message` is enabled (Layer 1), and a Layer 2 rule checks the
 destination JID against an allowlist file (`vip_contacts.json`) —
 the inverse of a denylist. If the JID isn't on the list, the send is
 refused, no exceptions, no override flag.
 
+**C. "Read-only" observer** — a variant that can see everything but touch
+nothing. `send-message` is removed entirely (Layer 1): with no write
+command wired up, sending isn't reachable by anyone, through the CLI or
+the MCP, no matter what the LLM asks. The tool becomes pure observation —
+the strongest restriction there is, because there's no rule to get wrong.
+
+**D. "Rate-limited sender"** — a variant that trusts the agent to send but
+not to *spam*. `send-message` stays enabled (Layer 1), and a Layer 2 rule
+refuses once more than N messages have gone out in a rolling window (say,
+10 per hour, tracked in the local store). A runaway or hijacked agent is
+throttled regardless of recipient, and the cap can only be changed by
+editing and recompiling.
+
 ### Worked example — Layer 2 restriction: geography-based block
 
-A believable Layer 2 rule some might want: **block sending to any
-number that isn't a Saudi Arabia number (country code +966).**
+A Layer 2 rule some might want: on top of the individuals-only allowlist,
+**also block sending to any number that isn't a Saudi Arabia number
+(country code +966).**
 
 ```go
-// logic/disallow_sending_to_groups.go (or a sibling file, e.g.
-// logic/saudi_only.go, following the same pattern)
+// logic/sending_messages_only_to_people.go (or a sibling file in logic/,
+// e.g. logic/saudi_only.go, following the same pattern)
 
 const allowedCountryCode = "966"
 
 func CheckSend(to string) error {
-    if strings.HasSuffix(to, "@g.us") {
-        return errors.New("sending to groups is disabled by design")
+    // Base allowlist: individuals only (@s.whatsapp.net or @lid).
+    if !strings.HasSuffix(to, "@s.whatsapp.net") && !strings.HasSuffix(to, "@lid") {
+        return errors.New("message sending is only allowed to people")
     }
 
-    // JIDs for individuals look like "9665XXXXXXXX@s.whatsapp.net"
-    number := strings.TrimSuffix(to, "@s.whatsapp.net")
-    if !strings.HasPrefix(number, allowedCountryCode) {
-        return fmt.Errorf("refusing to send: %s is not a %s (+%s) number",
-            to, "Saudi Arabia", allowedCountryCode)
+    // Extra rule: phone-number individuals must be Saudi (+966).
+    if strings.HasSuffix(to, "@s.whatsapp.net") {
+        number := strings.TrimSuffix(to, "@s.whatsapp.net")
+        if !strings.HasPrefix(number, allowedCountryCode) {
+            return fmt.Errorf("refusing to send: %s is not a %s (+%s) number",
+                to, "Saudi Arabia", allowedCountryCode)
+        }
     }
 
     return nil
 }
 ```
 
-This is exactly the same *mechanism* as the group-block rule — a
-hardcoded, compile-time check inside the one choke point every send
-must pass through, called from `send_people.go` before `meow.go` ever
-touches the network. The only thing that changes between variants is
-which condition the rule checks. This is the intended pattern for any
-future restriction: add a condition in `logic/`, not a new flag or
-config option, if the rule should be non-negotiable rather than
+This is the same *mechanism* as the shipped rule — a hardcoded, compile-time
+check inside the one choke point every send must pass through, called from
+`send_message.go` before `meow.go` ever touches the network. The only thing
+that changes between variants is which condition the rule checks. This is the
+intended pattern for any future restriction: add a condition in `logic/`, not a
+new flag or config option, if the rule should be non-negotiable rather than
 toggleable.
 
 ---

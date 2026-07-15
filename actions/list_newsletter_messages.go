@@ -2,9 +2,15 @@ package actions
 
 import (
 	"errors"
+	"fmt"
 	"regexp"
 	"strconv"
 )
+
+// maxLimit caps any [limit] argument. Without a ceiling, a caller (e.g. an LLM)
+// could pass a huge count and trigger an unbounded live fetch + allocation on
+// the newsletter path — a cheap self-DoS knob. 200 is well past any real read.
+const maxLimit = 200
 
 // ListNewsletterMessages fetches recent messages from a newsletter (channel).
 func ListNewsletterMessages(args []string, fetch func(jid string, count int) (any, error)) (any, error) {
@@ -48,6 +54,9 @@ func optionalLimit(args []string, idx, def int) (int, error) {
 	n, err := strconv.Atoi(args[idx])
 	if err != nil || n < 1 {
 		return 0, errors.New("limit must be a positive integer")
+	}
+	if n > maxLimit {
+		return 0, fmt.Errorf("limit must be at most %d", maxLimit)
 	}
 	return n, nil
 }
